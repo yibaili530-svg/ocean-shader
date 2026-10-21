@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ocean · Golden hour</title>
+<style>
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#071423}canvas{display:block;width:100%;height:100%;touch-action:none}#stats,#controls{position:fixed;left:16px;color:white;opacity:.7;font:12px/1.6 monospace;pointer-events:none;text-shadow:0 1px 3px #0008;white-space:pre-line}#stats{top:12px}#controls{bottom:14px}#error{display:none;position:fixed;inset:16px 16px auto;background:#510a0a;color:#fff;padding:16px;white-space:pre-wrap;font:12px/1.5 monospace;max-height:75vh;overflow:auto}
+</style>
+</head>
+<body>
+<canvas id="ocean" aria-label="Interactive golden-hour ocean"></canvas>
+<div id="stats"></div>
+<div id="controls">Drag to look · Double-click to lock pointer · WASD move · Space / Q rise / dive
+Shift ×5 · Wheel changes speed · [ / ] scale · R auto-res · Esc releases pointer</div>
+<div id="error" role="alert"></div>
+<script>
+'use strict';
+const COMMON = `
+precision highp float;
+precision highp int;
+// Artistic and physical tuning, in metres, seconds and radians.
+const float PI=3.14159265359;
+const float TAU=6.28318530718;
+const float GRAVITY=9.81;
+const float SUN_ELEVATION=0.06981317008;
+const float SUN_RADIUS=0.00471238898;
+const vec3 SUN_DIR=vec3(0.0,0.069756474,-0.99756405);
+const vec3 SUN_COLOR=vec3(1.0,0.66,0.34);
+const float SUN_RADIANCE=60.0;
+const float SUN_IRRADIANCE=3.0;
+const vec3 ZENITH=vec3(0.030,0.095,0.420);
+const vec3 HORIZON_SUN=vec3(1.0,0.62,0.32);
+const vec3 HORIZON_AWAY=vec3(0.48,0.32,0.47);
+const vec3 ABSORPTION=vec3(0.45,0.09,0.05);
+const vec3 SCATTER=vec3(0.02,0.09,0.12);
+const float BASE_ROUGHNESS=0.04;
+const float FOAM_THRESHOLD=0.78;
+const float CLOUD_HAZE_START=0.025;
+const float CLOUD_HAZE_END=0.105;
+const float PANORAMA_ELEVATION_POWER=2.0;
+const float DISTANCE_ROUGHNESS=0.00020;
+const int WATER_MARCH_STEPS=32;
+const int GOD_RAY_STEPS=10;
+const float CLOUD_BOTTOM=1500.0;
+const float CLOUD_TOP=3000.0;
+const float CLOUD_COVERAGE=0.71;
+const float CLOUD_EXTINCTION=0.0045;
+const float CLOUD_WIND=3.0;
+const vec3 DEEP_WATER=vec3(0.0,0.02,0.05);
+const float EXPOSURE=1.05;
+const float BLOOM_STRENGTH=0.055;
+const float VIGNETTE=0.25;
+const float GRAIN=0.02;
+const float WAVE_RATIO=0.6344941742; // (2 / 120)^(1 / 9)
+const float AMPLITUDES[10]=float[10](0.60,0.35,0.22,0.16,0.115,0.078,0.053,0.035,0.024,0.016);
+const float ANGLES[10]=float[10](0.06,-0.32,0.49,-0.68,0.90,-0.16,0.65,-1.02,0.27,-0.52);
+const float PHASES[10]=float[10](0.4,2.1,4.8,1.3,5.5,3.2,0.7,4.2,2.7,5.9);
+const float STEEPNESS[10]=float[10](0.16,0.15,0.14,0.13,0.12,0.11,0.10,0.09,0.08,0.07);
+uniform float uTime;
+float sat(float x){return clamp(x,0.0,1.0);}
+vec3 safeNorm(vec3 v){return v*inversesqrt(max(dot(v,v),1e-8));}
+float hash12(vec2 p){vec3 p3=fract(vec3(p.xyx)*0.1031);p3+=dot(p3,p3.yzx+33.33);return fract((p3.x+p3.y)*p3.z);}
+float hash13(vec3 p){p=fract(p*0.1031);p+=dot(p,p.zyx+31.32);return fract((p.x+p.y)*p.z);}
+vec3 hash33(vec3 p){return vec3(hash13(p),hash13(p+17.17),hash13(p+43.73));}
+vec3 grad3(vec3 p){return safeNorm(hash33(p)*2.0-1.0);}
+float perlin(vec3 p){
+ vec3 i=floor(p),f=fract(p),u=f*f*f*(f*(f*6.0-15.0)+10.0);
+ float a=dot(grad3(i),f),b=dot(grad3(i+vec3(1,0,0)),f-vec3(1,0,0));
+ float c=dot(grad3(i+vec3(0,1,0)),f-vec3(0,1,0)),d=dot(grad3(i+vec3(1,1,0)),f-vec3(1,1,0));
+ float e=dot(grad3(i+vec3(0,0,1)),f-vec3(0,0,1)),g=dot(grad3(i+vec3(1,0,1)),f-vec3(1,0,1));
+ float h=dot(grad3(i+vec3(0,1,1)),f-vec3(0,1,1)),j=dot(grad3(i+vec3(1,1,1)),f-vec3(1,1,1));
+ return mix(mix(mix(a,b,u.x),mix(c,d,u.x),u.y),mix(mix(e,g,u.x),mix(h,j,u.x),u.y),u.z);
+}
+float worley(vec3 p){vec3 i=floor(p),f=fract(p);float d=4.0;for(int z=-1;z<=1;z++)for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec3 b=vec3(x,y,z);vec3 r=b+hash33(i+b)-f;d=min(d,dot(r,r));}return sqrt(max(d,1e-4));}
+float fbm(vec3 p){float n=0.0,a=0.57;for(int i=0;i<3;i++){n+=a*perlin(p);p=p*2.03+vec3(12.1,3.7,7.9);a*=0.5;}return n;}
+// Gradient noise and its exact spatial derivative for the normal-only ripples.
+vec3 noise2D(vec2 p){vec2 i=floor(p),f=fract(p),u=f*f*f*(f*(f*6.0-15.0)+10.0),du=30.0*f*f*(f-1.0)*(f-1.0);
+ vec2 ga=vec2(cos(TAU*hash12(i)),sin(TAU*hash12(i)));
+ vec2 gb=vec2(cos(TAU*hash12(i+vec2(1,0))),sin(TAU*hash12(i+vec2(1,0))));
+ vec2 gc=vec2(cos(TAU*hash12(i+vec2(0,1))),sin(TAU*hash12(i+vec2(0,1))));
+ vec2 gd=vec2(cos(TAU*hash12(i+vec2(1))),sin(TAU*hash12(i+vec2(1))));
+ float a=dot(ga,f),b=dot(gb,f-vec2(1,0)),c=dot(gc,f-vec2(0,1)),d=dot(gd,f-vec2(1));
+ float n=mix(mix(a,b,u.x),mix(c,d,u.x),u.y);
+ vec2 dn=mix(mix(ga,gb,u.x),mix(gc,gd,u.x),u.y)+du*vec2(mix(b-a,d-c,u.y),mix(c-a,d-b,u.x));return vec3(n,dn);
+}
+struct Water{float h;vec3 n;float jac;float lost;float ripple;};
+float waveFade(float wavelength,float fp){return smoothstep(2.0*fp,4.0*fp,wavelength);}
+// Invert the horizontal Gerstner displacement to evaluate an Eulerian x/z point.
+vec2 waveParam(vec2 x,float fp){vec2 q=x;for(int j=0;j<4;j++){vec2 disp=vec2(0);mat2 jac=mat2(1);float wavelength=120.0;
+ for(int i=0;i<10;i++){float k=TAU/wavelength,f=waveFade(wavelength,fp);if(f<=0.0)break;vec2 dir=vec2(sin(ANGLES[i]),cos(ANGLES[i]));float phase=k*dot(dir,q)-sqrt(GRAVITY*k)*uTime+PHASES[i];float s=STEEPNESS[i]*f;disp+=dir*(s/k)*cos(phase);jac-=s*sin(phase)*outerProduct(dir,dir);wavelength*=WAVE_RATIO;}
+ float det=determinant(jac);if(abs(det)<0.1)break;vec2 correction=inverse(jac)*(q+disp-x);q-=clamp(correction,vec2(-8),vec2(8));if(dot(correction,correction)<1e-8)break;}return q;}
+float heightOnly(vec2 x,float fp){
+ vec2 q=waveParam(x,fp);float height=0.0,wavelength=120.0;
+ for(int i=0;i<10;i++){float f=waveFade(wavelength,fp);if(f<=0.0)break;
+  float k=TAU/wavelength;vec2 dir=vec2(sin(ANGLES[i]),cos(ANGLES[i]));
+  height+=AMPLITUDES[i]*f*sin(k*dot(dir,q)-sqrt(GRAVITY*k)*uTime+PHASES[i]);wavelength*=WAVE_RATIO;
+ }return height;
+}
+Water water(vec2 x,float fp,bool detail){
+ vec2 q=waveParam(x,fp);float height=0.0,lost=0.0;vec3 dx=vec3(1,0,0),dz=vec3(0,0,1);float wavelength=120.0;
+ for(int i=0;i<10;i++){float k=TAU/wavelength,f=waveFade(wavelength,fp);lost+=0.5*pow(AMPLITUDES[i]*k,2.0)*(1.0-f*f);if(f<=0.0){wavelength*=WAVE_RATIO;continue;}vec2 dir=vec2(sin(ANGLES[i]),cos(ANGLES[i]));float phase=k*dot(dir,q)-sqrt(GRAVITY*k)*uTime+PHASES[i];float s=sin(phase),c=cos(phase),a=AMPLITUDES[i]*f,steep=STEEPNESS[i]*f;
+ height+=a*s;dx+=vec3(-steep*dir.x*dir.x*s,a*k*dir.x*c,-steep*dir.x*dir.y*s);dz+=vec3(-steep*dir.x*dir.y*s,a*k*dir.y*c,-steep*dir.y*dir.y*s);wavelength*=WAVE_RATIO;}
+ vec3 n=safeNorm(cross(dz,dx));float ripple=0.0;
+ if(detail){float wl=1.5;for(int i=0;i<2;i++){float f=waveFade(wl,fp),strength=i==0?0.075:0.045;vec3 nd=vec3(0);if(f>0.0)nd=noise2D(x/wl+vec2(uTime*0.11,-uTime*0.17)*(float(i)+1.0));n.xz-=nd.yz*strength*f;n=safeNorm(n);lost+=strength*strength*0.5*(1.0-f*f);ripple+=strength*f;wl=0.3;}}
+ return Water(height,n,dx.x*dz.z-dx.z*dz.x,lost,ripple);
+}
+float hg(float c,float g){return (1.0-g*g)/(4.0*PI*pow(max(1.0+g*g-2.0*g*c,1e-4),1.5));}
+vec3 clearSky(vec3 rd,bool disc){
+ float y=max(rd.y,0.0),toward=pow(sat(dot(safeNorm(vec3(rd.x,0,rd.z)),vec3(0,0,-1))*0.5+0.5),4.0);
+ vec3 horizon=mix(HORIZON_AWAY,HORIZON_SUN,toward);float horizonWeight=exp(-y*10.5);
+ vec3 col=mix(ZENITH,horizon,horizonWeight);float mu=clamp(dot(rd,SUN_DIR),-1.0,1.0);
+ col+=SUN_COLOR*0.045*hg(mu,0.76)*exp(-y*1.7);
+ if(disc){float angle=acos(mu),r=angle/SUN_RADIUS;float edge=1.0-smoothstep(0.96,1.04,r);float limb=0.45+0.55*sqrt(max(1.0-r*r,0.0));col+=SUN_COLOR*SUN_RADIANCE*edge*limb;}
+ return col;
+}
+float perlinWorleyFBM(vec3 p){
+ float value=0.0,weight=0.57;
+ for(int octave=0;octave<3;octave++){
+  float cell=1.0-worley(p*2.0+vec3(3,1,7));
+  value+=weight*(perlin(p)*0.75+(cell-0.45)*0.20);
+  p=p*2.03+vec3(12.1,3.7,7.9);weight*=0.5;
+ }
+ return value;
+}
+float cloudDensity(vec3 p){
+ float h=(p.y-CLOUD_BOTTOM)/(CLOUD_TOP-CLOUD_BOTTOM);if(h<=0.0||h>=1.0)return 0.0;
+ vec3 q=(p-vec3(0,0,CLOUD_WIND*uTime))*vec3(0.00115,0.0018,0.00115);
+ float shape=0.56+perlinWorleyFBM(q)-CLOUD_COVERAGE;
+ float profile=smoothstep(0.0,0.15,h)*(1.0-smoothstep(0.48,1.0,h));
+ return smoothstep(0.0,0.12,shape)*profile;
+}
+vec3 skyMarch(vec3 ro,vec3 rd,float jitter,bool disc){
+ vec3 background=clearSky(rd,disc);if(rd.y<=CLOUD_HAZE_START)return background;
+ float start=max(0.0,(CLOUD_BOTTOM-ro.y)/rd.y),end=max(0.0,(CLOUD_TOP-ro.y)/rd.y);
+ end=min(end,start+22000.0);if(end<=start)return background;
+ int count=int(mix(14.0,32.0,smoothstep(0.04,0.5,rd.y)));float stepLen=(end-start)/float(count),trans=1.0;vec3 sum=vec3(0);
+ float cosine=dot(rd,SUN_DIR),phase=0.8*hg(cosine,0.6)+0.2*hg(cosine,-0.2);
+ // Stable midpoint quadrature resolves the smooth puffs without pixel hash grain.
+ for(int i=0;i<32;i++){if(i>=count||trans<0.015)break;float t=start+(float(i)+0.5)*stepLen;vec3 p=ro+rd*t;float d=cloudDensity(p);if(d<0.005)continue;
+ float optical=0.0;for(int j=0;j<3;j++){float lt=(float(j)+0.5)*350.0;optical+=cloudDensity(p+SUN_DIR*lt)*350.0*CLOUD_EXTINCTION;}
+ float beer=exp(-optical),powder=2.0*(1.0-exp(-2.0*d));
+ vec3 ambient=vec3(0.35,0.42,0.55)*mix(0.65,1.15,sat((p.y-CLOUD_BOTTOM)/1500.0));
+ vec3 lighting=ambient+SUN_COLOR*(beer*(0.55+phase*5.0)*powder+pow(beer,3.0)*phase*0.7);
+ float alpha=1.0-exp(-d*stepLen*CLOUD_EXTINCTION);sum+=trans*alpha*lighting;trans*=1.0-alpha;
+ }
+ vec3 result=sum+background*trans;float haze=1.0-exp(-start*0.000018);return mix(background,mix(result,background,haze),smoothstep(CLOUD_HAZE_START,CLOUD_HAZE_END,rd.y));
+}
+`;
+const PANORAMA_FS = `#version 300 es
+${COMMON}
+in vec2 vUV; out vec4 fragColor;
+uniform vec2 uPanoramaSize;
+// Upper hemisphere: quadratic elevation packs rows around the warm horizon.
+// gl_FragCoord already includes the strip viewport's absolute row offset.
+void main(){vec2 uv=gl_FragCoord.xy/uPanoramaSize;float lon=(uv.x-0.5)*TAU;
+ float lat=pow(uv.y,PANORAMA_ELEVATION_POWER)*PI*0.5;
+ vec3 rd=vec3(cos(lat)*cos(lon),sin(lat),cos(lat)*sin(lon));
+ fragColor=vec4(max(skyMarch(vec3(0),rd,0.0,false),vec3(0)),1);}
+
+`;
+const SCENE_FS = `#version 300 es
+${COMMON}
+in vec2 vUV;
+out vec4 fragColor;
+uniform vec2 uResolution;
+uniform vec3 uCamera;
+uniform mat3 uCameraBasis;
+uniform bool uHDR;
+uniform float uAltitude;
+uniform sampler2D uPanorama;
+uniform vec2 uPanoramaSize;
+float pixelAngle;
+vec3 skyFromPanorama(vec3 rd){
+ rd=safeNorm(rd);float lon=atan(rd.z,rd.x),lat=asin(clamp(rd.y,0.0,1.0));
+ vec2 uv=vec2(lon/TAU+0.5,pow(lat/(PI*0.5),1.0/PANORAMA_ELEVATION_POWER));
+ vec3 col=texture(uPanorama,uv).rgb;
+ // A small angular reconstruction filter softens distant puffs before they enter haze.
+ float softness=1.0-smoothstep(0.10,0.28,rd.y);
+ if(softness>0.0){vec2 offset=vec2(1.25,2.0)*softness/uPanoramaSize;
+  col=col*0.4+0.15*(texture(uPanorama,uv+vec2(offset.x,0)).rgb+texture(uPanorama,uv-vec2(offset.x,0)).rgb
+   +texture(uPanorama,uv+vec2(0,offset.y)).rgb+texture(uPanorama,uv-vec2(0,offset.y)).rgb);
+ }return col;
+}
+// Pixel footprint also bounds the march's wave count at long distances.
+float geometryFootprint(float t){return t*max(pixelAngle,0.0015);}
+float surfaceResidual(vec3 ro,vec3 rd,float t){vec3 p=ro+rd*t;return p.y-heightOnly(p.xz,geometryFootprint(t));}
+bool intersectWater(vec3 ro,vec3 rd,out vec3 hit,out Water surface){
+ if(ro.y>1.76&&rd.y>=0.0){hit=ro;surface=Water(0.0,vec3(0,1,0),1.0,0.0,0.0);return false;}
+ // The CPU evaluates the identical unfiltered Gerstner sum once for the camera.
+ float initial=uAltitude,previous=0.0,prevF=initial;
+ float limit=40000.0,t=0.04;bool bracket=false;
+ // Flat-plane estimate supplies an initial candidate, bounded by the full wave envelope.
+ if(initial*rd.y<0.0&&abs(rd.y)>0.025){
+  float plane=clamp(-ro.y/rd.y,0.04,limit);
+  float nearBound=max(0.04,plane-1.76/abs(rd.y));
+  t=nearBound;
+  // Steep views have a unique crossing: seed a bracket directly from the estimate.
+  if(abs(rd.y)>0.65){float guess=clamp(plane+heightOnly((ro+rd*plane).xz,geometryFootprint(plane))/rd.y,0.04,limit);float f=surfaceResidual(ro,rd,guess);
+   if(f*initial<=0.0){t=guess;bracket=true;}else{previous=guess;prevF=f;t=min(limit,plane+1.76/abs(rd.y));bracket=true;}
+  }
+ }
+ for(int i=0;i<WATER_MARCH_STEPS;i++){
+  if(bracket)break;
+  vec3 p=ro+rd*t;float f=surfaceResidual(ro,rd,t);
+  if(f*initial<=0.0){bracket=true;break;}
+  if(abs(f)<0.002){previous=t;prevF=f;bracket=true;break;}
+  previous=t;prevF=f;
+  float slopeBound=0.0,wavelength=120.0,fp=geometryFootprint(t);
+  for(int j=0;j<10;j++){float fade=waveFade(wavelength,fp);if(fade<=0.0)break;slopeBound+=AMPLITUDES[j]*(TAU/wavelength)*fade;wavelength*=WAVE_RATIO;}
+  t+=max(0.06,abs(f)/(abs(rd.y)+max(slopeBound*1.6,0.001)));
+  if(t>limit){t=limit;break;}
+  if(rd.y>0.0&&p.y>2.0)break;
+ }
+ if(bracket){float a=previous,b=t,fa=prevF,fb=surfaceResidual(ro,rd,t);
+  for(int j=0;j<6;j++){if(b-a<0.001)break;
+   float fraction=clamp(fa/(abs(fa-fb)>1e-5?fa-fb:1e-5),0.05,0.95);
+   float c=mix(a,b,fraction),fc=surfaceResidual(ro,rd,c);
+   if(abs(fc)<0.0005){a=c;b=c;break;}
+   if(fc*fa>0.0){a=c;fa=fc;}else{b=c;fb=fc;}
+  }t=(a+b)*0.5;
+ }
+ hit=ro+rd*t;
+ // Grazing rays cover much more water than dist * pixelAngle alone predicts.
+ float shadingFP=max(geometryFootprint(t),max(length(dFdx(hit.xz)),length(dFdy(hit.xz))));
+ surface=water(hit.xz,shadingFP,true);
+ // Downward rays always retain the last position, including at the horizon.
+ return bracket||rd.y<0.0;
+}
+// Surface-only BRDF: Cox-Munk slopes, disc-widened GGX and correlated Smith.
+float fresnelWater(float NoV,float roughness){
+ float f=0.02+0.98*pow(1.0-sat(NoV),5.0);
+ return mix(f,clamp(f*0.72+0.06,0.0,1.0),sat(roughness*1.5));
+}
+float ggxD(float NoH,float alpha){float a2=alpha*alpha,d=(NoH*a2-NoH)*NoH+1.0;return a2/max(PI*d*d,1e-8);}
+float smithGGXCorrelated(float NoV,float NoL,float alpha){
+ float a2=alpha*alpha;
+ float gv=NoL*sqrt(NoV*NoV*(1.0-a2)+a2),gl=NoV*sqrt(NoL*NoL*(1.0-a2)+a2);
+ return 0.5/max(gv+gl,1e-6);
+}
+vec3 waterReflection(vec3 r,float alpha){
+ float lat=asin(clamp(r.y,0.0,1.0));
+ vec2 uv=vec2(atan(r.z,r.x)/TAU+0.5,pow(lat/(PI*0.5),1.0/PANORAMA_ELEVATION_POWER));
+ // The panorama has no mip chain. Reconstruct the lobe at the matching LOD
+ // with five taps; map its angular width through the quadratic elevation UV.
+ float lod=max(log2(max(alpha*0.5*uPanoramaSize.x/TAU,1.0)),0.0);
+ float radius=exp2(lod)*TAU/uPanoramaSize.x;
+ float low=pow(max(lat-radius,0.0)/(PI*0.5),1.0/PANORAMA_ELEVATION_POWER);
+ float high=pow(min(lat+radius,PI*0.5)/(PI*0.5),1.0/PANORAMA_ELEVATION_POWER);
+ float dx=radius/(TAU*max(cos(lat),0.1));
+ return texture(uPanorama,uv).rgb*0.4+0.15*(texture(uPanorama,uv+vec2(dx,0)).rgb
+  +texture(uPanorama,uv-vec2(dx,0)).rgb+texture(uPanorama,vec2(uv.x,low)).rgb+texture(uPanorama,vec2(uv.x,high)).rgb);
+}
+vec3 aboveWater(vec3 ro,vec3 rd,float jitter){
+ vec3 p;Water w;bool hit=intersectWater(ro,rd,p,w);if(!hit)return skyFromPanorama(rd)+clearSky(rd,true)-clearSky(rd,false);
+ const float BODY_GAIN=3.8;
+ const float SPEC_MAX=8.0;
+ float dist=length(p-ro);vec3 n=safeNorm(mix(w.n,vec3(0,1,0),0.3*smoothstep(200.0,1000.0,dist))),v=-rd;
+ // Only slope variance below the shading footprint belongs in the BRDF.
+ float fp=max(dist*pixelAngle,max(length(dFdx(p.xz)),length(dFdy(p.xz))));
+ vec3 resolved=vec3(waveFade(2.0,fp),waveFade(1.5,fp),waveFade(0.3,fp));
+ float unresolved=dot(vec3(0.06,0.30,0.64),vec3(1)-resolved*resolved);
+ float mss=0.003+0.00512*7.0;
+ float mssUnresolved=mss*max(unresolved,0.10)+0.0009;
+ float alpha=clamp(sqrt(2.0*mssUnresolved),0.012,0.62),roughness=clamp(sqrt(alpha),0.02,0.86);
+ vec3 reflected=reflect(rd,n);
+ if(reflected.y<0.0)reflected=safeNorm(vec3(reflected.x,mix(0.02,0.35,roughness)-reflected.y*0.15,reflected.z));
+ vec3 reflection=waterReflection(reflected,alpha)*vec3(0.59,0.64,0.66);
+ // Cosine-weighted ambient from the existing cloud/sky panorama, E / PI.
+ vec3 skyIrradiance=texture(uPanorama,vec2(0.5,1.0)).rgb*0.4142
+  +(texture(uPanorama,vec2(0.25,0.70710678)).rgb+texture(uPanorama,vec2(0.75,0.70710678)).rgb)*0.2929;
+ vec3 sun=SUN_COLOR*SUN_IRRADIANCE,waterScatter=vec3(0.010,0.045,0.092),waterAbsorb=vec3(0.003,0.016,0.036);
+ // Balance diffuse illumination for a clear blue-green body at fixed exposure.
+ const vec3 BODY_SKY_BALANCE=vec3(3.2,2.20,0.83);
+ vec3 bodySky=skyIrradiance*BODY_SKY_BALANCE;
+ float sunUp=max(SUN_DIR.y,0.0);
+ vec3 body=waterScatter*(sun*sunUp*(1.0-fresnelWater(sunUp,0.0))/PI+bodySky*0.94)+waterAbsorb*bodySky*0.8;
+ float heightNorm=clamp(w.h*0.35+0.35,0.0,1.5);
+ float backlit=heightNorm*pow(sat(dot(SUN_DIR,-v)),4.0)*pow(0.5-0.5*dot(SUN_DIR,n),3.0);
+ body+=waterScatter*sun*backlit*3.4/(1.0+max(0.0,-SUN_DIR.y)*4.0);
+ body*=BODY_GAIN;
+ float NoV=max(dot(n,v),1e-4),NoL=max(dot(n,SUN_DIR),0.0);
+ vec3 spec=vec3(0);
+ if(NoL>0.0){vec3 h=safeNorm(v+SUN_DIR);float NoH=max(dot(n,h),0.0),VoH=max(dot(v,h),1e-4);
+  float aP=clamp(alpha+0.00465/2.0,0.0,1.0),normalisation=alpha*alpha/(aP*aP);
+  float Fs=0.02+0.98*pow(1.0-VoH,5.0);
+  float glint=ggxD(NoH,aP)*smithGGXCorrelated(NoV,NoL,alpha)*Fs*NoL*normalisation;
+  // Soft-cap HDR energy before tonemapping; transmitted sunlight keeps the path gold.
+  vec3 transmittedSun=SUN_COLOR*SUN_COLOR;
+  float specHDR=SUN_IRRADIANCE*glint*0.5;
+  spec=transmittedSun*(SPEC_MAX*specHDR/(SPEC_MAX+specHDR));
+ }
+ vec3 color=mix(body,reflection,fresnelWater(NoV,roughness))+spec;
+ // Existing folds and crests seed sparse rafts, eroded into downwind streaks.
+ float breaker=(1.0-smoothstep(FOAM_THRESHOLD-0.13,FOAM_THRESHOLD,w.jac))*smoothstep(0.12,0.65,w.h);
+ vec2 windDir=vec2(sin(0.06),cos(0.06));
+ mat2 windFrame=mat2(windDir.x,-windDir.y,windDir.y,windDir.x);
+ vec2 foamUV=(windFrame*p.xz)*vec2(0.22,1.0)*0.8-vec2(uTime*0.12,0);
+ float raft=sat(0.5+noise2D(foamUV).x),fine=sat(0.5+noise2D(foamUV*2.03+7.0).x);
+ float foamNoise=raft*0.65+fine*0.35;
+ float onset=0.80,carved=breaker*(0.10+foamNoise*1.55);
+ float foamDistance=smoothstep(12.0,24.0,dist)*(1.0-smoothstep(140.0,260.0,dist));
+ float foam=smoothstep(onset,onset+0.30,carved)*mix(0.35,1.0,fine)*waveFade(3.5,dist*pixelAngle)*foamDistance;
+ vec3 foamAlbedo=vec3(0.93,0.96,0.985)*mix(0.62,1.0,fine);
+ float wrapNoL=sat((dot(n,SUN_DIR)+0.45)/1.45);
+ vec3 foamLight=foamAlbedo*(vec3(0.28)+sun*wrapNoL*0.035+bodySky*0.20);
+ color=mix(color,foamLight,foam);
+ float foamThin=smoothstep(onset*0.85,onset+0.30,carved)*waveFade(3.5,dist*pixelAngle)*foamDistance;
+ color=mix(color,foamLight,foamThin*(1.0-foam)*0.20);
+ vec3 horizon=clearSky(safeNorm(vec3(rd.x,0.001,rd.z)),false);color=mix(color,horizon,1.0-exp(-dist*0.00012));return min(color,vec3(60));
+}
+vec2 voronoiEdges(vec2 p){vec2 cell=floor(p),f=fract(p);float a=10.0,b=10.0;for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 o=vec2(x,y);float h=hash12(cell+o);vec2 delta=o+vec2(h,hash12(cell+o+27.1))-f;float d=dot(delta,delta);if(d<a){b=a;a=d;}else b=min(b,d);}return vec2(sqrt(max(a,1e-4)),sqrt(max(b,1e-4)));}
+float caustic(vec2 p){vec2 warp=vec2(noise2D(p*0.21+uTime*0.04).x,noise2D(p*0.19-uTime*0.05+9.0).x);vec2 a=voronoiEdges(p*0.65+warp+vec2(uTime*0.14,0));vec2 b=voronoiEdges(p*1.17-warp+vec2(0,-uTime*0.1));return pow(1.0-smoothstep(0.015,0.16,a.y-a.x),2.0)+0.6*pow(1.0-smoothstep(0.01,0.12,b.y-b.x),2.0);}
+vec3 underWater(vec3 ro,vec3 rd,float jitter){
+ float depth=max(-uAltitude,0.0);
+ // Slant views see the dark water column; upward views retain surface light.
+ float surfaceLight=smoothstep(0.25,0.80,rd.y);
+ float viewDepth=depth+30.0*(1.0-surfaceLight);
+ vec3 fog=mix(vec3(0.05,0.22,0.20),DEEP_WATER,sat(viewDepth/30.0));
+ vec3 p;Water w;bool hit=rd.y>0.0&&intersectWater(ro,rd,p,w);float distance=hit?length(p-ro):mix(48.0,110.0,sat(-rd.y));
+ vec3 color=fog*mix(0.11,0.85,sat(rd.y*0.6+0.4));
+ if(hit){vec3 n=w.n;float cosine=sat(dot(rd,n));float critical=sqrt(1.0-1.0/(1.333*1.333));
+  vec3 tir=reflect(rd,-n);vec3 underwaterReflection=fog*(0.25+0.6*sat(tir.y))+vec3(0.004,0.012,0.025);
+  float window=smoothstep(critical-0.015,critical+0.015,cosine);vec3 refracted=refract(rd,-n,1.333);refracted=safeNorm(vec3(refracted.x,max(refracted.y,0.01),refracted.z));
+  vec3 outside=skyFromPanorama(refracted);float fres=0.02+0.98*pow(1.0-cosine,5.0);vec3 surface=mix(underwaterReflection,mix(outside,underwaterReflection,fres),window);
+  vec3 attenuation=exp(-ABSORPTION*distance);color=surface*attenuation+fog*(1.0-attenuation)*0.55;
+ }
+ vec3 refractedSun=safeNorm(vec3(SUN_DIR.x/1.333,sqrt(max(1.0-(1.0-SUN_DIR.y*SUN_DIR.y)/(1.333*1.333),1e-4)),SUN_DIR.z/1.333));
+ vec3 shafts=vec3(0);float stepLen=min(distance,65.0)/float(GOD_RAY_STEPS),phase=hg(dot(rd,refractedSun),0.8);
+ for(int i=0;i<GOD_RAY_STEPS;i++){float t=(float(i)+jitter)*stepLen;vec3 samplePos=ro+rd*t;float d=max(0.0,heightOnly(samplePos.xz,2.5)-samplePos.y);vec2 projection=samplePos.xz+refractedSun.xz*(d/max(refractedSun.y,1e-4));float pattern=caustic(projection);float shade=0.25+0.75*smoothstep(-0.25,0.4,noise2D(projection*0.055+uTime*0.03).x);shafts+=exp(-ABSORPTION*(t+d))*SUN_COLOR*(0.03+pattern*0.13)*shade*stepLen*(0.15+phase);}
+ float shaftWindow=smoothstep(0.55,0.80,rd.y);
+ color=mix(DEEP_WATER,color,surfaceLight);
+ color+=shafts*shaftWindow;return color;
+}
+void main(){vec2 screen=(gl_FragCoord.xy*2.0-uResolution)/uResolution.y;pixelAngle=1.15470054/uResolution.y;
+ vec3 rd=safeNorm(uCameraBasis*vec3(screen.x,screen.y,-1.7320508));float jitter=hash12(gl_FragCoord.xy+vec2(uTime*17.0,uTime*11.0));
+ vec3 col;if(uAltitude>0.15)col=aboveWater(uCamera,rd,jitter);else if(uAltitude< -0.15)col=underWater(uCamera,rd,jitter);else col=mix(underWater(uCamera,rd,jitter),aboveWater(uCamera,rd,jitter),smoothstep(-0.15,0.15,uAltitude));
+ col=clamp(col,vec3(0),vec3(60));
+ // RGBM keeps the RGBA8 fallback's dark ocean precise under manual exposure.
+ if(uHDR)fragColor=vec4(col,1.0);else{vec3 exposed=col/64.0;float m=max(1.0/255.0,ceil(max(max(exposed.r,exposed.g),exposed.b)*255.0)/255.0);fragColor=vec4(exposed/m,m);}
+}
+`;
+const BLOOM_DOWN_FS = `#version 300 es
+${COMMON}
+in vec2 vUV;out vec4 fragColor;
+uniform sampler2D uSource;uniform vec2 uTexel;uniform bool uFirst;uniform bool uHDR;
+vec3 bloomRead(vec2 uv){vec4 sampleColor=texture(uSource,uv);return sampleColor.rgb*((uFirst&&!uHDR)?sampleColor.a:1.0);}
+float luminance(vec3 c){return dot(c,vec3(0.2126,0.7152,0.0722));}
+void main(){
+ vec3 a=bloomRead(vUV+uTexel*vec2(-2,2)),b=bloomRead(vUV+uTexel*vec2(0,2)),c=bloomRead(vUV+uTexel*vec2(2,2));
+ vec3 d=bloomRead(vUV+uTexel*vec2(-2,0)),e=bloomRead(vUV),f=bloomRead(vUV+uTexel*vec2(2,0));
+ vec3 g=bloomRead(vUV+uTexel*vec2(-2,-2)),h=bloomRead(vUV+uTexel*vec2(0,-2)),i=bloomRead(vUV+uTexel*vec2(2,-2));
+ vec3 j=bloomRead(vUV+uTexel*vec2(-1,1)),k=bloomRead(vUV+uTexel*vec2(1,1)),l=bloomRead(vUV+uTexel*vec2(-1,-1)),m=bloomRead(vUV+uTexel*vec2(1,-1));
+ vec3 result;if(uFirst){float decode=uHDR?1.0:64.0;vec3 groups[5]=vec3[5]((a+b+d+e)*0.25,(b+c+e+f)*0.25,(d+e+g+h)*0.25,(e+f+h+i)*0.25,(j+k+l+m)*0.25);result=vec3(0);float total=0.0;
+ for(int n=0;n<5;n++){float weight=(n==4?0.5:0.125)/(1.0+luminance(groups[n]*decode));result+=groups[n]*weight;total+=weight;}result/=max(total,1e-4);
+ float lum=luminance(result*decode),threshold=0.8,knee=0.5;float soft=clamp(lum-threshold+knee,0.0,2.0*knee);soft=soft*soft/(4.0*knee+1e-4);result*=max(lum-threshold,soft)/max(lum,1e-4);
+ }else result=e*0.125+(a+c+g+i)*0.03125+(b+d+f+h)*0.0625+(j+k+l+m)*0.125;
+ fragColor=vec4(max(result,vec3(0)),1);
+}
+`;
+const BLOOM_UP_FS = `#version 300 es
+${COMMON}
+in vec2 vUV;out vec4 fragColor;uniform sampler2D uSource;uniform sampler2D uBase;uniform vec2 uTexel;
+void main(){vec3 sum=vec3(0);for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){float weight=float((x==0?2:1)*(y==0?2:1));sum+=texture(uSource,vUV+vec2(x,y)*uTexel).rgb*weight;}fragColor=vec4(texture(uBase,vUV).rgb+sum*(1.0/16.0),1);}
+`;
+const COMPOSITE_FS = `#version 300 es
+${COMMON}
+in vec2 vUV;out vec4 fragColor;uniform sampler2D uScene;uniform sampler2D uBloom;uniform bool uHDR;
+vec3 aces(vec3 c){
+ const mat3 inputMatrix=mat3(0.59719,0.07600,0.02840, 0.35458,0.90834,0.13383, 0.04823,0.01566,0.83777);
+ const mat3 outputMatrix=mat3(1.60475,-0.10208,-0.00327, -0.53108,1.10813,-0.07276, -0.07367,-0.00605,1.07602);
+ c=inputMatrix*c;vec3 a=c*(c+0.0245786)-0.000090537,b=c*(0.983729*c+0.4329510)+0.238081;return clamp(outputMatrix*(a/max(b,vec3(1e-4))),0.0,1.0);
+}
+vec3 srgb(vec3 x){return mix(12.92*x,1.055*pow(max(x,vec3(1e-4)),vec3(1.0/2.4))-0.055,step(vec3(0.0031308),x));}
+void main(){float decode=uHDR?1.0:64.0;vec4 scene=texture(uScene,vUV);vec3 color=(scene.rgb*(uHDR?1.0:scene.a)+texture(uBloom,vUV).rgb*BLOOM_STRENGTH)*decode*EXPOSURE;color=aces(color);
+ vec2 edge=vUV*2.0-1.0;color*=1.0-VIGNETTE*sat(dot(edge,edge)*0.5);
+ float grain=hash12(gl_FragCoord.xy+uTime*vec2(37,71))-0.5;color+=grain*GRAIN*sqrt(max(dot(color,vec3(0.2126,0.7152,0.0722)),1e-4));
+ color=srgb(clamp(color,0.0,1.0));float dither=(hash12(gl_FragCoord.xy+13.0)-hash12(gl_FragCoord.yx+71.0))/255.0;fragColor=vec4(clamp(color+dither,0.0,1.0),1);
+}
+`;
+// Setup. The only geometry is a vertex-ID full-screen triangle.
+const canvas=document.getElementById('ocean'),stats=document.getElementById('stats'),errorBox=document.getElementById('error');
+function fail(message){errorBox.style.display='block';errorBox.textContent+=message+'\n';console.error(message);}
+const gl=canvas.getContext('webgl2',{alpha:false,antialias:false,depth:false,stencil:false,preserveDrawingBuffer:true,powerPreference:'high-performance'});
+if(!gl){fail('WebGL2 is required.');throw new Error('WebGL2 unavailable');}
+const hdr=!!gl.getExtension('EXT_color_buffer_float');
+const VS=`#version 300 es
+precision highp float;out vec2 vUV;void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);vUV=p;gl_Position=vec4(p*2.0-1.0,0,1);}`;
+const shaderLogs=[];
+function shader(type,source,name){const s=gl.createShader(type);gl.shaderSource(s,source);gl.compileShader(s);const log=gl.getShaderInfoLog(s)||'';shaderLogs.push({name,log});if(log.trim())fail(name+': '+log);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){if(!log)fail(name+': compilation failed');throw new Error(name+' compilation failed');}return s;}
+function program(source,name){const p=gl.createProgram(),v=shader(gl.VERTEX_SHADER,VS,name+' vertex'),f=shader(gl.FRAGMENT_SHADER,source,name+' fragment');gl.attachShader(p,v);gl.attachShader(p,f);gl.linkProgram(p);const log=gl.getProgramInfoLog(p)||'';shaderLogs.push({name:name+' link',log});if(log.trim())fail(name+' link: '+log);if(!gl.getProgramParameter(p,gl.LINK_STATUS)){if(!log)fail(name+' link failed');throw new Error(name+' link failed');}gl.deleteShader(v);gl.deleteShader(f);return {p,uniforms:new Map()};}
+const panoramaProgram=program(PANORAMA_FS,'panorama'),sceneProgram=program(SCENE_FS,'sceneRT'),downProgram=program(BLOOM_DOWN_FS,'bloom down'),upProgram=program(BLOOM_UP_FS,'bloom up'),compositeProgram=program(COMPOSITE_FS,'composite');
+const vao=gl.createVertexArray();gl.bindVertexArray(vao);
+function uniformLocation(p,n){if(!p.uniforms.has(n))p.uniforms.set(n,gl.getUniformLocation(p.p,n));return p.uniforms.get(n);}
+function f1(p,n,x){gl.uniform1f(uniformLocation(p,n),x);}function i1(p,n,x){gl.uniform1i(uniformLocation(p,n),x);}function v2(p,n,x,y){gl.uniform2f(uniformLocation(p,n),x,y);}
+function texture(p,name,target,unit){gl.activeTexture(gl.TEXTURE0+unit);gl.bindTexture(gl.TEXTURE_2D,target.texture);i1(p,name,unit);}
+function target(width,height){const texture=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,texture);const filter=gl.LINEAR; /* RGBA16F linear filtering is core in WebGL2. */gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,filter);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);gl.texImage2D(gl.TEXTURE_2D,0,hdr?gl.RGBA16F:gl.RGBA8,width,height,0,gl.RGBA,hdr?gl.HALF_FLOAT:gl.UNSIGNED_BYTE,null);const framebuffer=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,framebuffer);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,texture,0);if(gl.checkFramebufferStatus(gl.FRAMEBUFFER)!==gl.FRAMEBUFFER_COMPLETE)throw new Error('Incomplete render target');return {texture,framebuffer,width,height};}
+function release(t){if(t){gl.deleteTexture(t.texture);gl.deleteFramebuffer(t.framebuffer);}}
+let sceneRT=null,down=[],up=[],lastWidth=0,lastHeight=0,lastScale=0;
+const panoramaRT=target(2048,512); let panoramaRow=0, panoramaReady=false;
+gl.bindTexture(gl.TEXTURE_2D,panoramaRT.texture);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+
+function resize(){const dpr=Math.min(devicePixelRatio||1,1),width=Math.max(1,Math.round(innerWidth*dpr)),height=Math.max(1,Math.round(innerHeight*dpr));if(width===lastWidth&&height===lastHeight&&renderScale===lastScale)return;canvas.width=width;canvas.height=height;lastWidth=width;lastHeight=height;lastScale=renderScale;release(sceneRT);down.forEach(release);up.forEach(release);const w=Math.max(1,Math.round(width*renderScale)),h=Math.max(1,Math.round(height*renderScale));sceneRT=target(w,h);down=[];up=[];for(let i=0;i<5;i++){down.push(target(Math.max(1,w>>(i+1)),Math.max(1,h>>(i+1))));if(i<4)up.push(target(down[i].width,down[i].height));}}
+// URL parameters. A supplied time freezes every animated shader and camera effect.
+const params=new URLSearchParams(location.search);
+function parameter(name,defaultValue){const s=params.get(name),n=s===null?NaN:Number(s);return Number.isFinite(n)?n:defaultValue;}
+let autoScale=false;
+let renderScale=Math.min(1,Math.max(.35,parameter('scale',1)));
+let scaleAdjustTime=0;
+const frozen=params.has('t'),fixedTime=parameter('t',0);
+const camera={x:parameter('x',0),y:parameter('y',2.5),z:parameter('z',0),yaw:parameter('yaw',0),pitch:Math.max(-1.55,Math.min(1.55,parameter('pitch',.03)))};
+let speed=4,drag=false,bobOffset=camera.y,calmPitch=0,calmRoll=0;
+const keys=new Set();
+// Input.
+addEventListener('keydown',e=>{if(['Space','KeyW','KeyA','KeyS','KeyD','KeyQ','BracketLeft','BracketRight'].includes(e.code))e.preventDefault();keys.add(e.code);if(e.code==='BracketLeft'||e.code==='BracketRight')autoScale=false;if(e.code==='KeyR')autoScale=!autoScale;if(e.code==='BracketLeft')renderScale=Math.max(.25,Math.round((renderScale-.05)*100)/100);if(e.code==='BracketRight')renderScale=Math.min(1,Math.round((renderScale+.05)*100)/100);});
+addEventListener('keyup',e=>keys.delete(e.code));addEventListener('blur',()=>{keys.clear();drag=false;});
+canvas.addEventListener('pointerdown',e=>{drag=true;canvas.setPointerCapture(e.pointerId);});canvas.addEventListener('pointerup',()=>drag=false);canvas.addEventListener('pointercancel',()=>drag=false);
+canvas.addEventListener('dblclick',()=>{if(canvas.requestPointerLock){const p=canvas.requestPointerLock();if(p&&p.catch)p.catch(()=>{});}});
+addEventListener('mousemove',e=>{if(drag||document.pointerLockElement===canvas){camera.yaw+=e.movementX*.002;camera.pitch=Math.max(-1.55,Math.min(1.55,camera.pitch-e.movementY*.002));}});
+canvas.addEventListener('wheel',e=>{e.preventDefault();speed=Math.max(.5,Math.min(50,speed*Math.exp(-e.deltaY*.001)));},{passive:false});
+canvas.addEventListener('webglcontextlost',e=>{e.preventDefault();fail('WebGL context lost. Reload to resume.');cancelAnimationFrame(animation);});
+// waterHeight: the same ten Gerstner waves and horizontal Newton inversion as GLSL.
+const amplitudes=[.60,.35,.22,.16,.115,.078,.053,.035,.024,.016],angles=[.06,-.32,.49,-.68,.90,-.16,.65,-1.02,.27,-.52],phases=[.4,2.1,4.8,1.3,5.5,3.2,.7,4.2,2.7,5.9],steepness=[.16,.15,.14,.13,.12,.11,.10,.09,.08,.07];
+const waves=amplitudes.map((a,i)=>{const wavelength=120*Math.pow(.6344941742,i),k=2*Math.PI/wavelength;return {a,k,omega:Math.sqrt(9.81*k),dx:Math.sin(angles[i]),dz:Math.cos(angles[i]),phase:phases[i],s:steepness[i]};});
+function waterHeight(x,z,t){let qx=x,qz=z;for(let j=0;j<4;j++){let ox=0,oz=0,jxx=1,jxz=0,jzz=1;for(const w of waves){const p=w.k*(w.dx*qx+w.dz*qz)-w.omega*t+w.phase,s=Math.sin(p),c=Math.cos(p);ox+=w.dx*w.s/w.k*c;oz+=w.dz*w.s/w.k*c;jxx-=w.s*w.dx*w.dx*s;jxz-=w.s*w.dx*w.dz*s;jzz-=w.s*w.dz*w.dz*s;}const det=jxx*jzz-jxz*jxz;if(Math.abs(det)<.1)break;const ex=qx+ox-x,ez=qz+oz-z;qx-=Math.max(-8,Math.min(8,(jzz*ex-jxz*ez)/det));qz-=Math.max(-8,Math.min(8,(jxx*ez-jxz*ex)/det));}let height=0;for(const w of waves)height+=w.a*Math.sin(w.k*(w.dx*qx+w.dz*qz)-w.omega*t+w.phase);return height;}
+window.waterHeight=waterHeight;
+window.__ocean={fps:0,altitude:camera.y-waterHeight(camera.x,camera.z,frozen?fixedTime:0),renderScale,frames:0,hdr};
+// Render loop: sceneRT → five downsample levels → tent reconstruction → canvas.
+let animation=0,start=performance.now(),last=start,fpsStart=start,fpsFrames=0;
+function draw(p,t){gl.useProgram(p.p);gl.bindFramebuffer(gl.FRAMEBUFFER,t?t.framebuffer:null);gl.viewport(0,0,t?t.width:canvas.width,t?t.height:canvas.height);}
+function triangle(){gl.drawArrays(gl.TRIANGLES,0,3);}
+function render(now){try{const dt=Math.min(.05,Math.max(0,(now-last)/1000));last=now;const time=frozen?fixedTime:(now-start)/1000;
+ const shift=keys.has('ShiftLeft')||keys.has('ShiftRight'),step=speed*(shift?5:1)*dt;let forward=Number(keys.has('KeyW'))-Number(keys.has('KeyS')),right=Number(keys.has('KeyD'))-Number(keys.has('KeyA'));const horizontal=Math.max(1,Math.hypot(forward,right));forward/=horizontal;right/=horizontal;camera.x+=(Math.sin(camera.yaw)*forward+Math.cos(camera.yaw)*right)*step;camera.z+=(-Math.cos(camera.yaw)*forward+Math.sin(camera.yaw)*right)*step;const vertical=Number(keys.has('Space'))-Number(keys.has('KeyQ'));camera.y+=vertical*step;
+ const height=waterHeight(camera.x,camera.z,time),altitude=camera.y-height;
+ if(Math.abs(altitude)<1&&!frozen&&!vertical){bobOffset+=(altitude-bobOffset)*(1-Math.exp(-dt*.4));camera.y+=(height+bobOffset-camera.y)*(1-Math.exp(-dt*1.4));const sx=(waterHeight(camera.x+.3,camera.z,time)-waterHeight(camera.x-.3,camera.z,time))/.6,sz=(waterHeight(camera.x,camera.z+.3,time)-waterHeight(camera.x,camera.z-.3,time))/.6;calmPitch+=(sz*.07-calmPitch)*(1-Math.exp(-dt));calmRoll+=(-sx*.06-calmRoll)*(1-Math.exp(-dt));}else{bobOffset=altitude;calmPitch*=Math.exp(-dt);calmRoll*=Math.exp(-dt);}
+ resize();const yaw=camera.yaw,pitch=camera.pitch+calmPitch,cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),cr=Math.cos(calmRoll),sr=Math.sin(calmRoll);
+ const r=[cy,0,sy],u=[-sy*sp,cp,cy*sp],back=[-sy*cp,-sp,cy*cp],basis=new Float32Array([r[0]*cr+u[0]*sr,r[1]*cr+u[1]*sr,r[2]*cr+u[2]*sr,u[0]*cr-r[0]*sr,u[1]*cr-r[1]*sr,u[2]*cr-r[2]*sr,...back]);
+ // Refresh a small band of the cached sky/cloud panorama each frame.
+ if(!panoramaReady||!frozen){
+  draw(panoramaProgram,panoramaRT);const panoRows=panoramaReady?8:panoramaRT.height;
+  gl.viewport(0,panoramaReady?panoramaRow:0,panoramaRT.width,panoRows);
+  f1(panoramaProgram,'uTime',time);v2(panoramaProgram,'uPanoramaSize',panoramaRT.width,panoramaRT.height);triangle();
+  if(panoramaReady)panoramaRow=(panoramaRow+8)%panoramaRT.height;else panoramaReady=true;
+ }
+ draw(sceneProgram,sceneRT);f1(sceneProgram,'uTime',time); texture(sceneProgram,'uPanorama',panoramaRT,3); v2(sceneProgram,'uPanoramaSize',panoramaRT.width,panoramaRT.height);v2(sceneProgram,'uResolution',sceneRT.width,sceneRT.height);gl.uniform3f(uniformLocation(sceneProgram,'uCamera'),camera.x,camera.y,camera.z);gl.uniformMatrix3fv(uniformLocation(sceneProgram,'uCameraBasis'),false,basis);i1(sceneProgram,'uHDR',hdr?1:0);f1(sceneProgram,'uAltitude',camera.y-height);triangle();
+ let source=sceneRT;for(let i=0;i<5;i++){draw(downProgram,down[i]);texture(downProgram,'uSource',source,0);v2(downProgram,'uTexel',1/source.width,1/source.height);i1(downProgram,'uFirst',i===0?1:0);i1(downProgram,'uHDR',hdr?1:0);triangle();source=down[i];}
+ for(let i=3;i>=0;i--){draw(upProgram,up[i]);texture(upProgram,'uSource',source,0);texture(upProgram,'uBase',down[i],1);v2(upProgram,'uTexel',1/source.width,1/source.height);triangle();source=up[i];}
+ draw(compositeProgram,null);texture(compositeProgram,'uScene',sceneRT,0);texture(compositeProgram,'uBloom',source,1);i1(compositeProgram,'uHDR',hdr?1:0);f1(compositeProgram,'uTime',time);triangle();
+ const state=window.__ocean;state.frames++;fpsFrames++;if(now-fpsStart>=500){state.fps=Math.round(fpsFrames*1000/(now-fpsStart));fpsFrames=0;fpsStart=now; if(autoScale){ if(state.fps<54) renderScale=Math.max(.35,Math.round((renderScale-.05)*100)/100); else if(state.fps>61) renderScale=Math.min(1,Math.round((renderScale+.03)*100)/100); }}state.altitude=camera.y-height;state.renderScale=renderScale;
+ stats.textContent=state.fps+' FPS  ·  '+state.altitude.toFixed(2)+' m above water\nScale '+renderScale.toFixed(2)+(autoScale?' auto':' manual')+'  ·  '+sceneRT.width+' × '+sceneRT.height;
+ animation=requestAnimationFrame(render);
+ }catch(error){fail(error.stack||String(error));}}
+animation=requestAnimationFrame(render);
+</script>
+</body>
+</html>
